@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from asyncio import Task
-from typing import Coroutine, Optional
+from asyncio import Task, StreamWriter, StreamReader
+from typing import Coroutine, Optional, Set
 
 from haffmpeg.core import HAFFmpeg, FFMPEG_STDERR
 from homeassistant.components import ffmpeg
@@ -50,23 +50,28 @@ async def async_setup_entry(
 
 class UnixSocketProxy:
     def __init__(self, socket_path):
-        self.socket_path = socket_path
-        self.readers = set()
-        self.writer_reader = None
+        self.socket_path: str = socket_path
+        self.readers: Set[StreamWriter] = set()
+        self.writer_reader: Optional[StreamReader] = None
 
     async def start(self):
         if os.path.exists(self.socket_path):
             os.unlink(self.socket_path)
 
         server = await asyncio.start_unix_server(self.handle_connection, path=self.socket_path)
-        print(f"Serving on {self.socket_path}")
+        logger.log(logging.DEBUG, f"Unix socket server started at {self.socket_path}")
         async with server:
             await server.serve_forever()
 
-    async def handle_connection(self, reader, writer):
+    async def handle_connection(self, reader: StreamReader, writer: StreamWriter) -> None:
         if not self.writer_reader:
             self.writer_reader = reader
-            await self.handle_writer()
+            writer_task = asyncio.create_task(self.handle_writer())
+            try:
+                await writer.wait_closed()
+            finally:
+                writer_task.cancel()
+                self.writer_reader = None
         else:
             self.readers.add(writer)
             try:
@@ -111,12 +116,19 @@ class CameraMjpegWithAudio(HAFFmpeg):
         input_source = f"-i {mjpeg_source} -i {audio_source}"
 
         command = [
-            "-c:v", "libx264",  # Transcode MJPEG to H.264
+            "-c:v", "libx264",  # Transcode MJPEG to H.264 (home assistant stream requirement)
             "-preset", "ultrafast",  # Use the fastest encoding preset
             "-tune", "zerolatency",  # Optimize for low-latency streaming
-            "-c:a", "aac",  # Always transcode audio to AAC
+            "-c:a", "aac",  # Always transcode audio to AAC (home assistant stream requirement)
             "-ac", "2",  # Ensure stereo audio output
             "-f", "mpegts",  # Output MPEG-TS format
+            "-re",  # Read input at native frame rate
+            "-nostdin",  # Do not read from stdin
+            "-stimeout", "5000000",  # Set timeout for reading input in microseconds
+            "-reconnect", "1",  # Enable auto-reconnect
+            "-reconnect_streamed", "1",  # Enable auto-reconnect for streamed inputs
+            "-reconnect_at_eof", "1",  # Enable auto-reconnect at end of file
+            "-reconnect_delay_max", "2",  # Set maximum delay between reconnections
         ]
 
         if self.proxy_task is not None:
@@ -202,8 +214,8 @@ class IPWebcamCamera(MjpegCamera):
                 def update_callback() -> None:
                     if not self.stream.available:
                         self.hass.loop.create_task(camera_mjpeg_with_audio.close())
-                    if not stream_debug_task.done():
-                        stream_debug_task.cancel()
+                        if not stream_debug_task.done():
+                            stream_debug_task.cancel()
                     self.async_write_ha_state()
 
                 self.stream.set_update_callback(update_callback)
