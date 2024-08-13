@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Coroutine, Mapping, Self
+from typing import Coroutine
 
 from haffmpeg.core import HAFFmpeg
 from homeassistant.components import ffmpeg
-from homeassistant.components.camera import DynamicStreamSettings, CAMERA_STREAM_SOURCE_TIMEOUT, DATA_CAMERA_PREFS
+from homeassistant.components.camera import CAMERA_STREAM_SOURCE_TIMEOUT, DATA_CAMERA_PREFS, \
+    CameraEntityFeature
 from homeassistant.components.ffmpeg import FFmpegManager
 from homeassistant.components.mjpeg import MjpegCamera, filter_urllib3_logging
-from homeassistant.components.stream import Stream, CONF_RTSP_TRANSPORT, StreamSettings, ATTR_STREAMS, create_stream
+from homeassistant.components.stream import Stream, create_stream
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_HOST,
@@ -87,6 +88,7 @@ class IPWebcamCamera(MjpegCamera):
     """Representation of a IP Webcam camera."""
 
     _attr_has_entity_name = True
+    _attr_supported_features: CameraEntityFeature = CameraEntityFeature.STREAM
 
     def __init__(self, coordinator: AndroidIPCamDataUpdateCoordinator, ffmpeg_manager: FFmpegManager) -> None:
         """Initialize the camera."""
