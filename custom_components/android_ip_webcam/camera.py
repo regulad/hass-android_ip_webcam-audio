@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from asyncio import Task
 from typing import Coroutine, Optional
 
-from haffmpeg.core import HAFFmpeg
+from haffmpeg.core import HAFFmpeg, FFMPEG_STDERR
 from homeassistant.components import ffmpeg
 from homeassistant.components.camera import CAMERA_STREAM_SOURCE_TIMEOUT, DATA_CAMERA_PREFS, \
     CameraEntityFeature
@@ -27,6 +28,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import AndroidIPCamDataUpdateCoordinator
+
+logger = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -113,8 +116,7 @@ class CameraMjpegWithAudio(HAFFmpeg):
             "-tune", "zerolatency",  # Optimize for low-latency streaming
             "-c:a", "aac",  # Always transcode audio to AAC
             "-ac", "2",  # Ensure stereo audio output
-            "-f", "matroska",  # Use Matroska container for compatibility
-            "-movflags", "+faststart",  # Optimize for streaming
+            "-f", "mpegts",  # Output MPEG-TS format
         ]
 
         if self.proxy_task is not None:
@@ -147,7 +149,6 @@ class IPWebcamCamera(MjpegCamera):
         self._audio_url = coordinator.cam.audio_aac_url
         self._mjpeg_url = coordinator.cam.mjpeg_url
         self._ffmpeg_manager = ffmpeg_manager
-        self._camera_mjpeg_with_audio = CameraMjpegWithAudio(ffmpeg_manager.binary)
 
         super().__init__(
             mjpeg_url=self._mjpeg_url,
@@ -169,8 +170,7 @@ class IPWebcamCamera(MjpegCamera):
             self._create_stream_lock = asyncio.Lock()
         async with self._create_stream_lock:
             if not self.stream:
-                if self._camera_mjpeg_with_audio.is_running:
-                    await self._camera_mjpeg_with_audio.close()
+                camera_mjpeg_with_audio = CameraMjpegWithAudio(self._ffmpeg_manager.binary)
 
                 async with asyncio.timeout(CAMERA_STREAM_SOURCE_TIMEOUT):
                     mjpeg_source = await self.stream_source()
@@ -180,11 +180,18 @@ class IPWebcamCamera(MjpegCamera):
                 if not self._audio_url:
                     return None
 
-                await self._camera_mjpeg_with_audio.open_camera(mjpeg_source, self._audio_url)
+                await camera_mjpeg_with_audio.open_camera(mjpeg_source, self._audio_url)
+                stream_reader = await camera_mjpeg_with_audio.get_reader(FFMPEG_STDERR)
+
+                async def log_stream():
+                    async for line in stream_reader:
+                        logger.debug(line)
+
+                stream_debug_task = asyncio.create_task(log_stream())
 
                 self.stream = create_stream(
                     self.hass,
-                    f"unix://{self._camera_mjpeg_with_audio.socket_path}",
+                    f"unix://{camera_mjpeg_with_audio.socket_path}",
                     options=self.stream_options,
                     dynamic_stream_settings=await self.hass.data[
                         DATA_CAMERA_PREFS
@@ -194,7 +201,9 @@ class IPWebcamCamera(MjpegCamera):
 
                 def update_callback() -> None:
                     if not self.stream.available:
-                        self.hass.loop.create_task(self._camera_mjpeg_with_audio.close())
+                        self.hass.loop.create_task(camera_mjpeg_with_audio.close())
+                    if not stream_debug_task.done():
+                        stream_debug_task.cancel()
                     self.async_write_ha_state()
 
                 self.stream.set_update_callback(update_callback)
