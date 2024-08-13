@@ -51,8 +51,7 @@ async def async_setup_entry(
 class UnixSocketProxy:
     def __init__(self, socket_path):
         self.socket_path: str = socket_path
-        self.readers: Set[StreamWriter] = set()
-        self.writer_reader: Optional[StreamReader] = None
+        self.listeners: Set[StreamWriter] = set()
 
     async def start(self):
         if os.path.exists(self.socket_path):
@@ -64,29 +63,27 @@ class UnixSocketProxy:
             await server.serve_forever()
 
     async def handle_connection(self, reader: StreamReader, writer: StreamWriter) -> None:
-        if not self.writer_reader:
-            self.writer_reader = reader
-            writer_task = asyncio.create_task(self.handle_writer())
-            try:
-                await writer.wait_closed()
-            finally:
-                writer_task.cancel()
-                self.writer_reader = None
-        else:
-            self.readers.add(writer)
-            try:
-                await writer.wait_closed()
-            finally:
-                self.readers.remove(writer)
+        self.listeners.add(writer)
+        writer_task = asyncio.create_task(self.handle_reader(reader, writer))
+        try:
+            await writer.wait_closed()
+        finally:
+            self.listeners.remove(writer)
+            writer_task.cancel()
 
-    async def handle_writer(self):
+    async def handle_reader(self, reader: StreamReader, writer: StreamWriter) -> None:
         while True:
-            data = await self.writer_reader.read(4096)
+            data = await reader.read(4096)
+            logger.log(logging.DEBUG, f"Read {len(data)} bytes from writer")
             if not data:
                 break
-            for reader in self.readers:
-                reader.write(data)
-            await asyncio.gather(*[reader.drain() for reader in self.readers])
+            writers_written_to = set()
+            for reader in self.listeners:
+                if reader != writer and not reader.is_closing():
+                    reader.write(data)
+                    writers_written_to.add(reader)
+            await asyncio.gather(*[reader.drain() for reader in writers_written_to])
+            await asyncio.sleep(0)  # yield
 
 
 class CameraMjpegWithAudio(HAFFmpeg):
@@ -122,9 +119,7 @@ class CameraMjpegWithAudio(HAFFmpeg):
             "-c:a", "aac",  # Always transcode audio to AAC (home assistant stream requirement)
             "-ac", "2",  # Ensure stereo audio output
             "-f", "mpegts",  # Output MPEG-TS format
-            "-re",  # Read input at native frame rate
             "-nostdin",  # Do not read from stdin
-            "-stimeout", "5000000",  # Set timeout for reading input in microseconds
             "-reconnect", "1",  # Enable auto-reconnect
             "-reconnect_streamed", "1",  # Enable auto-reconnect for streamed inputs
             "-reconnect_at_eof", "1",  # Enable auto-reconnect at end of file
@@ -141,6 +136,7 @@ class CameraMjpegWithAudio(HAFFmpeg):
             input_source=input_source,
             output=f"unix://{self.socket_path}",
             extra_cmd=None,
+            stderr_pipe=True,
         )
 
     async def close(self, timeout=5):
@@ -197,7 +193,8 @@ class IPWebcamCamera(MjpegCamera):
 
                 async def log_stream():
                     async for line in stream_reader:
-                        logger.debug(line)
+                        line: bytes
+                        logger.debug(line.decode("utf-8", errors="ignore").strip("\n"))
 
                 stream_debug_task = asyncio.create_task(log_stream())
 
