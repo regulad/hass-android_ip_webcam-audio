@@ -64,7 +64,7 @@ class UnixSocketProxy:
             os.unlink(self.socket_path)
 
         server = await asyncio.start_unix_server(self.handle_connection, path=self.socket_path)
-        logger.log(logging.DEBUG, f"Unix socket server started at {self.socket_path}")
+        logger.debug(f"Unix socket server started at {self.socket_path}")
         async with server:
             await server.serve_forever()
 
@@ -80,7 +80,7 @@ class UnixSocketProxy:
     async def handle_reader(self, reader: StreamReader, writer: StreamWriter) -> None:
         try:
             while True:
-                data = await reader.read(4096)
+                data = await reader.read(188)  # Read MPEG-TS packet size (lower latency)
                 if not data:
                     break
                 logger.log(logging.DEBUG, f"Read {len(data)} bytes from writer")
@@ -138,7 +138,7 @@ class CameraMjpegWithAudio(HAFFmpeg):
         if not audio_source.endswith(('.wav', '.aac', '.opus')):
             raise ValueError("Audio source must end with '.wav', '.aac', or '.opus'")
 
-        input_source = f"-i {mjpeg_source} -i {audio_source}"
+        input_source = f"-fflags nobuffer -i {mjpeg_source} -i {audio_source}"
 
         command = [
             "-c:v", "libx264",  # Transcode MJPEG to H.264 (home assistant stream requirement)
@@ -152,6 +152,9 @@ class CameraMjpegWithAudio(HAFFmpeg):
             "-reconnect_streamed", "1",  # Enable auto-reconnect for streamed inputs
             "-reconnect_at_eof", "1",  # Enable auto-reconnect at end of file
             "-reconnect_delay_max", "2",  # Set maximum delay between reconnections
+            "-vsync", "1",  # Soft frame dropping
+            "-use_wallclock_as_timestamps", "1",  # Use wall clock for RTP timestamps
+            "-avoid_negative_ts", "make_zero",
         ]
 
         if self.proxy_task is not None:
