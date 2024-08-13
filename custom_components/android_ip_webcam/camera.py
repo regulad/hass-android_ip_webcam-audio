@@ -48,10 +48,16 @@ async def async_setup_entry(
     async_add_entities([IPWebcamCamera(coordinator, ffmpeg_manager)])
 
 
+async def _write_and_drain(writer: StreamWriter, data: bytes) -> None:
+    writer.write(data)
+    await writer.drain()
+
+
 class UnixSocketProxy:
-    def __init__(self, socket_path):
+    def __init__(self, socket_path, write_timeout=5):
         self.socket_path: str = socket_path
         self.listeners: Set[StreamWriter] = set()
+        self.write_timeout = write_timeout
 
     async def start(self):
         if os.path.exists(self.socket_path):
@@ -72,18 +78,40 @@ class UnixSocketProxy:
             writer_task.cancel()
 
     async def handle_reader(self, reader: StreamReader, writer: StreamWriter) -> None:
-        while True:
-            data = await reader.read(4096)
-            logger.log(logging.DEBUG, f"Read {len(data)} bytes from writer")
-            if not data:
-                break
-            writers_written_to = set()
-            for reader in self.listeners:
-                if reader != writer and not reader.is_closing():
-                    reader.write(data)
-                    writers_written_to.add(reader)
-            await asyncio.gather(*[reader.drain() for reader in writers_written_to])
-            await asyncio.sleep(0)  # yield
+        try:
+            while True:
+                data = await reader.read(4096)
+                if not data:
+                    break
+                logger.log(logging.DEBUG, f"Read {len(data)} bytes from writer")
+
+                async def write_to_listener(listener: StreamWriter):
+                    if listener != writer and not listener.is_closing():
+                        try:
+                            await asyncio.wait_for(_write_and_drain(listener, data), timeout=self.write_timeout)
+                        except TimeoutError:
+                            logger.warning(f"Write operation timed out after {self.write_timeout} seconds")
+                        except Exception as e:
+                            logger.error(f"Error writing to listener: {e}")
+                            # Optionally, remove the problematic listener
+                            # self.listeners.remove(listener)
+                        else:
+                            logger.log(logging.DEBUG, f"Wrote {len(data)} bytes to listener")
+
+                # Create tasks for writing to each listener
+                write_tasks = [asyncio.create_task(write_to_listener(listener))
+                               for listener in self.listeners]
+
+                # Wait for all write operations to complete
+                await asyncio.gather(*write_tasks, return_exceptions=True)
+
+        except asyncio.CancelledError:
+            logger.info("Reader task was cancelled")
+        except Exception as e:
+            logger.error(f"Error in handle_reader: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
 
 class CameraMjpegWithAudio(HAFFmpeg):
